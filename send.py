@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Script d'envoi d'emails utilisant Postfix sur Google Cloud Shell
-Avec système de test périodique
-Auteur: Assistant IA
+Script d'envoi d'emails intelligent pour Google Cloud Shell
+Avec gestion de pause, rotation, templates multiples et reprise automatique
+Auteur: Expert IA
 Usage: python3 send.py
 """
 
@@ -11,96 +11,422 @@ import sys
 import subprocess
 import time
 import re
-from datetime import datetime
+import json
+import random
+import hashlib
+import pickle
+from datetime import datetime, timedelta
 import signal
 import argparse
-import json
 import shutil
+from pathlib import Path
+import sqlite3
+from typing import List, Dict, Tuple, Optional
+import logging
 
-class PostfixMailer:
-    def __init__(self, config_dir="."):
-        self.config_dir = config_dir
-        self.load_config()
+# Configuration du logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('email_sender.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class EmailManager:
+    """Gestionnaire intelligent d'envoi d'emails"""
+    
+    def __init__(self, config_dir="config"):
+        self.config_dir = Path(config_dir)
+        self.config_dir.mkdir(exist_ok=True)
+        
+        # Initialiser les bases de données
+        self.init_databases()
+        
+        # Charger la configuration
+        self.load_configuration()
+        
+        # Configurer Postfix
         self.setup_postfix()
-        self.test_interval = 500  # Tous les 500 emails par défaut
-        self.last_test_time = None
-        self.stats = {
-            'total_sent': 0,
-            'total_failed': 0,
-            'last_test_sent': 0,
-            'start_time': datetime.now(),
-            'batch_history': []
-        }
         
-    def load_config(self):
-        """Charge les fichiers de configuration"""
-        config_files = {
-            'header': '0-header.txt',
-            'data': '1-data.txt',
-            'body': '2-body.html',
-            'test_after': '3-testafter.txt'
-        }
+        # Variables d'état
+        self.current_session = None
+        self.pause_after = 100  # Pause après 100 emails par défaut
+        self.pause_duration = 300  # 5 minutes par défaut
         
-        self.config = {}
-        for key, filename in config_files.items():
-            filepath = os.path.join(self.config_dir, filename)
-            try:
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    self.config[key] = f.read().strip()
-            except FileNotFoundError:
-                print(f"⚠️  Fichier {filename} non trouvé")
-                if key == 'header':
-                    self.config[key] = "From: Mon Service <noreply@localhost>\nMIME-Version: 1.0\nContent-Type: text/html; charset=utf-8"
-                elif key == 'body':
-                    self.config[key] = "<html><body><h1>Email de Test</h1><p>Ceci est un email de test.</p></body></html>"
-                else:
-                    self.config[key] = ""
+    def init_databases(self):
+        """Initialiser les bases de données SQLite"""
+        # Base de données principale
+        self.db_path = self.config_dir / "email_manager.db"
+        self.conn = sqlite3.connect(self.db_path)
+        self.cursor = self.conn.cursor()
         
-        # Charger la liste d'emails
-        data_file = os.path.join(self.config_dir, '1-data.txt')
-        if os.path.exists(data_file):
-            with open(data_file, 'r', encoding='utf-8') as f:
-                self.email_list = [line.strip() for line in f if line.strip() and '@' in line]
+        # Créer les tables si elles n'existent pas
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_id TEXT PRIMARY KEY,
+                start_time DATETIME,
+                end_time DATETIME,
+                total_emails INTEGER,
+                sent_emails INTEGER,
+                failed_emails INTEGER,
+                status TEXT,
+                config_hash TEXT
+            )
+        ''')
+        
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS email_logs (
+                log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
+                email_address TEXT,
+                template_id INTEGER,
+                subject_id INTEGER,
+                from_id INTEGER,
+                send_time DATETIME,
+                status TEXT,
+                error_message TEXT,
+                FOREIGN KEY (session_id) REFERENCES sessions (session_id)
+            )
+        ''')
+        
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS templates (
+                template_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                content TEXT,
+                is_active BOOLEAN DEFAULT 1,
+                weight INTEGER DEFAULT 1
+            )
+        ''')
+        
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS subjects (
+                subject_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                subject_text TEXT,
+                is_active BOOLEAN DEFAULT 1,
+                weight INTEGER DEFAULT 1
+            )
+        ''')
+        
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS from_lines (
+                from_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                email TEXT,
+                is_active BOOLEAN DEFAULT 1,
+                weight INTEGER DEFAULT 1
+            )
+        ''')
+        
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS email_lists (
+                list_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                file_path TEXT,
+                total_emails INTEGER,
+                last_position INTEGER DEFAULT 0
+            )
+        ''')
+        
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS rotation_rules (
+                rule_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                rule_type TEXT,
+                value INTEGER,
+                is_active BOOLEAN DEFAULT 1
+            )
+        ''')
+        
+        self.conn.commit()
+        
+    def load_configuration(self):
+        """Charger la configuration depuis les fichiers"""
+        # Créer la structure de dossiers si nécessaire
+        (self.config_dir / "templates").mkdir(exist_ok=True)
+        (self.config_dir / "email_lists").mkdir(exist_ok=True)
+        
+        # Charger la configuration générale
+        self.config = self.load_json_config("config.json", {
+            "pause_after": 100,
+            "pause_duration": 300,
+            "test_interval": 50,
+            "delay_between_emails": 1,
+            "max_emails_per_session": 1000,
+            "rotation_mode": "random",  # random, sequential, weighted
+            "enable_test_emails": True,
+            "test_email_recipients": [],
+            "postfix_config": {
+                "myhostname": "localhost",
+                "inet_interfaces": "loopback-only"
+            }
+        })
+        
+        # Mettre à jour les variables
+        self.pause_after = self.config["pause_after"]
+        self.pause_duration = self.config["pause_duration"]
+        
+        # Charger les templates
+        self.load_templates()
+        
+        # Charger les sujets
+        self.load_subjects()
+        
+        # Charger les from lines
+        self.load_from_lines()
+        
+        # Charger les listes d'emails
+        self.load_email_lists()
+        
+        # Charger les règles de rotation
+        self.load_rotation_rules()
+        
+    def load_json_config(self, filename: str, default_config: dict) -> dict:
+        """Charger un fichier JSON ou créer avec des valeurs par défaut"""
+        filepath = self.config_dir / filename
+        if filepath.exists():
+            with open(filepath, 'r', encoding='utf-8') as f:
+                return json.load(f)
         else:
-            self.email_list = []
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(default_config, f, indent=2)
+            return default_config
         
-        # Extraire l'intervalle de test du fichier test_after
-        if self.config['test_after']:
-            interval_match = re.search(r'test_interval\s*[:=]\s*(\d+)', self.config['test_after'])
-            if interval_match:
-                self.test_interval = int(interval_match.group(1))
-                print(f"📊 Intervalle de test configuré: tous les {self.test_interval} emails")
+    def load_templates(self):
+        """Charger les templates depuis la base de données et les fichiers"""
+        # Vérifier s'il y a des templates dans la base
+        self.cursor.execute("SELECT COUNT(*) FROM templates WHERE is_active = 1")
+        count = self.cursor.fetchone()[0]
+        
+        if count == 0:
+            # Créer des templates par défaut
+            default_templates = [
+                ("Template 1", self.get_default_template(1), 1),
+                ("Template 2", self.get_default_template(2), 1),
+                ("Template 3", self.get_default_template(3), 1)
+            ]
             
+            for name, content, weight in default_templates:
+                self.cursor.execute(
+                    "INSERT INTO templates (name, content, weight) VALUES (?, ?, ?)",
+                    (name, content, weight)
+                )
+            
+            self.conn.commit()
+        
+        # Charger les templates actifs
+        self.cursor.execute(
+            "SELECT template_id, name, content, weight FROM templates WHERE is_active = 1"
+        )
+        self.templates = [
+            {
+                'id': row[0],
+                'name': row[1],
+                'content': row[2],
+                'weight': row[3]
+            }
+            for row in self.cursor.fetchall()
+        ]
+        
+    def get_default_template(self, number: int) -> str:
+        """Retourner un template par défaut"""
+        templates = [
+            """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Email Important</title>
+</head>
+<body style="font-family: Arial, sans-serif; line-height: 1.6;">
+    <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+        <h1 style="color: #333;">Message Important</h1>
+        <p>Cher destinataire,</p>
+        <p>Ceci est notre premier template d'email.</p>
+        <p>Email: {{email}}</p>
+        <p>Date: {{timestamp}}</p>
+        <p>Template: {{template_name}}</p>
+        <p><strong>Ceci est un message important pour vous.</strong></p>
+        <p>Cordialement,<br>L'équipe de support</p>
+    </div>
+</body>
+</html>""",
+            """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Nouvelle Offre</title>
+</head>
+<body style="font-family: Georgia, serif; line-height: 1.8;">
+    <div style="max-width: 600px; margin: 0 auto; padding: 30px; background-color: #f9f9f9;">
+        <div style="text-align: center; margin-bottom: 30px;">
+            <h2 style="color: #2c3e50;">OFFRE SPÉCIALE</h2>
+        </div>
+        <p>Bonjour,</p>
+        <p>Nous avons une offre spéciale qui pourrait vous intéresser.</p>
+        <div style="background-color: #fff; padding: 20px; border-left: 4px solid #3498db; margin: 20px 0;">
+            <p><strong>Détails de l'offre:</strong></p>
+            <p>• Email: {{email}}</p>
+            <p>• Heure: {{timestamp}}</p>
+            <p>• Référence: {{template_name}}</p>
+        </div>
+        <p>Ne manquez pas cette opportunité !</p>
+        <p>Bien à vous,<br>L'équipe commerciale</p>
+    </div>
+</body>
+</html>""",
+            """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Newsletter</title>
+</head>
+<body style="font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;">
+    <div style="max-width: 600px; margin: 0 auto; border: 1px solid #ddd;">
+        <div style="background-color: #4CAF50; color: white; padding: 20px; text-align: center;">
+            <h1>NEWSLETTER</h1>
+        </div>
+        <div style="padding: 30px;">
+            <p>Salut !</p>
+            <p>Voici les dernières nouvelles de notre newsletter.</p>
+            <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+                <tr>
+                    <td style="border: 1px solid #ddd; padding: 10px;"><strong>Destinataire</strong></td>
+                    <td style="border: 1px solid #ddd; padding: 10px;">{{email}}</td>
+                </tr>
+                <tr>
+                    <td style="border: 1px solid #ddd; padding: 10px;"><strong>Date</strong></td>
+                    <td style="border: 1px solid #ddd; padding: 10px;">{{timestamp}}</td>
+                </tr>
+                <tr>
+                    <td style="border: 1px solid #ddd; padding: 10px;"><strong>Template</strong></td>
+                    <td style="border: 1px solid #ddd; padding: 10px;">{{template_name}}</td>
+                </tr>
+            </table>
+            <p>Restez connecté pour plus d'actualités !</p>
+            <p>À bientôt,<br>L'équipe communication</p>
+        </div>
+    </div>
+</body>
+</html>"""
+        ]
+        
+        return templates[number - 1] if 1 <= number <= 3 else templates[0]
+        
+    def load_subjects(self):
+        """Charger les sujets depuis la base de données"""
+        self.cursor.execute(
+            "SELECT subject_id, subject_text, weight FROM subjects WHERE is_active = 1"
+        )
+        self.subjects = [
+            {
+                'id': row[0],
+                'text': row[1],
+                'weight': row[2]
+            }
+            for row in self.cursor.fetchall()
+        ]
+        
+        if not self.subjects:
+            # Créer des sujets par défaut
+            default_subjects = [
+                ("Message important de notre équipe", 1),
+                ("Nouvelle offre spéciale pour vous", 1),
+                ("Votre newsletter mensuelle", 1),
+                ("Mise à jour importante", 1),
+                ("Opportunité exclusive", 1)
+            ]
+            
+            for text, weight in default_subjects:
+                self.cursor.execute(
+                    "INSERT INTO subjects (subject_text, weight) VALUES (?, ?)",
+                    (text, weight)
+                )
+            
+            self.conn.commit()
+            self.load_subjects()  # Recharger
+        
+    def load_from_lines(self):
+        """Charger les from lines depuis la base de données"""
+        self.cursor.execute(
+            "SELECT from_id, name, email, weight FROM from_lines WHERE is_active = 1"
+        )
+        self.from_lines = [
+            {
+                'id': row[0],
+                'name': row[1],
+                'email': row[2],
+                'weight': row[3]
+            }
+            for row in self.cursor.fetchall()
+        ]
+        
+        if not self.from_lines:
+            # Créer des from lines par défaut
+            default_froms = [
+                ("Support Technique", "support@example.com", 1),
+                ("Équipe Commerciale", "commercial@example.com", 1),
+                ("Service Clients", "client@example.com", 1),
+                ("Administration", "admin@example.com", 1)
+            ]
+            
+            for name, email, weight in default_froms:
+                self.cursor.execute(
+                    "INSERT INTO from_lines (name, email, weight) VALUES (?, ?, ?)",
+                    (name, email, weight)
+                )
+            
+            self.conn.commit()
+            self.load_from_lines()  # Recharger
+        
+    def load_email_lists(self):
+        """Charger les listes d'emails"""
+        self.cursor.execute("SELECT list_id, name, file_path, last_position FROM email_lists")
+        self.email_lists = [
+            {
+                'id': row[0],
+                'name': row[1],
+                'file_path': row[2],
+                'last_position': row[3]
+            }
+            for row in self.cursor.fetchall()
+        ]
+        
+    def load_rotation_rules(self):
+        """Charger les règles de rotation"""
+        self.cursor.execute("SELECT rule_type, value FROM rotation_rules WHERE is_active = 1")
+        self.rotation_rules = {row[0]: row[1] for row in self.cursor.fetchall()}
+        
     def setup_postfix(self):
-        """Configure Postfix automatiquement pour Google Cloud Shell"""
-        print("🔧 Configuration de Postfix pour Google Cloud Shell...")
+        """Configurer Postfix pour Google Cloud Shell"""
+        logger.info("Configuration de Postfix pour Google Cloud Shell...")
         
         # Vérifier les privilèges
         if os.geteuid() != 0:
-            print("❌ Ce script nécessite des privilèges sudo.")
-            print("   Veuillez exécuter: sudo python3 send.py")
+            logger.error("Ce script nécessite des privilèges sudo.")
+            logger.error("Veuillez exécuter: sudo python3 send.py")
             sys.exit(1)
         
         # Vérifier si Postfix est déjà installé
-        postfix_installed = shutil.which('postfix') is not None
-        
-        if not postfix_installed:
-            print("📦 Installation de Postfix et dépendances...")
+        if shutil.which('postfix') is None:
+            logger.info("Installation de Postfix et dépendances...")
             try:
                 subprocess.run(['apt-get', 'update', '-y'], check=True, capture_output=True)
-                subprocess.run(['apt-get', 'install', '-y', 'postfix', 'mailutils', 'libsasl2-2', 'libsasl2-modules'], 
+                subprocess.run(['apt-get', 'install', '-y', 'postfix', 'mailutils'], 
                              check=True, capture_output=True)
-                print("✅ Postfix installé avec succès")
+                logger.info("Postfix installé avec succès")
             except subprocess.CalledProcessError as e:
-                print(f"❌ Erreur lors de l'installation: {e.stderr.decode()}")
+                logger.error(f"Erreur lors de l'installation: {e.stderr.decode()}")
                 sys.exit(1)
         else:
-            print("✅ Postfix est déjà installé")
+            logger.info("Postfix est déjà installé")
         
-        # Configurer Postfix pour Google Cloud Shell (sans systemd)
-        postfix_config = """# Postfix configuration for Google Cloud Shell
-myhostname = localhost
-inet_interfaces = loopback-only
+        # Configurer Postfix
+        postfix_config = f"""# Postfix configuration for Google Cloud Shell
+myhostname = {self.config['postfix_config']['myhostname']}
+inet_interfaces = {self.config['postfix_config']['inet_interfaces']}
 inet_protocols = all
 relayhost = 
 mydestination = localhost
@@ -110,13 +436,6 @@ smtp_tls_security_level = none
 mailbox_size_limit = 0
 recipient_delimiter = +
 disable_vrfy_command = yes
-strict_rfc821_envelopes = no
-smtpd_error_sleep_time = 0
-smtpd_soft_error_limit = 1000
-smtpd_hard_error_limit = 1000
-queue_run_delay = 300
-minimal_backoff_time = 300
-maximal_backoff_time = 4000
 """
         
         # Sauvegarder l'ancienne configuration
@@ -128,123 +447,99 @@ maximal_backoff_time = 4000
         with open('/etc/postfix/main.cf', 'w') as f:
             f.write(postfix_config)
         
-        # Redémarrer Postfix avec service (pas systemctl)
-        print("🔄 Redémarrage de Postfix...")
+        # Redémarrer Postfix
+        self.restart_postfix()
+        
+    def restart_postfix(self):
+        """Redémarrer Postfix"""
+        logger.info("Redémarrage de Postfix...")
         try:
-            # Arrêter Postfix
-            subprocess.run(['service', 'postfix', 'stop'], check=False, capture_output=True)
-            time.sleep(1)
+            # Essayer avec service
+            subprocess.run(['service', 'postfix', 'restart'], 
+                          capture_output=True, text=True, check=False)
             
-            # Démarrer Postfix
-            result = subprocess.run(['service', 'postfix', 'start'], 
-                                  capture_output=True, text=True)
-            
-            if result.returncode == 0:
-                print("✅ Postfix démarré avec succès")
+            # Vérifier si Postfix tourne
+            time.sleep(2)
+            result = subprocess.run(['ps', 'aux'], capture_output=True, text=True)
+            if 'postfix' in result.stdout or 'master' in result.stdout:
+                logger.info("✅ Postfix démarré avec succès")
             else:
-                print("⚠️  Utilisation de la méthode alternative...")
                 # Essayer avec postfix directement
                 subprocess.run(['postfix', 'stop'], check=False)
                 time.sleep(1)
                 subprocess.run(['postfix', 'start'], check=True)
-                print("✅ Postfix démarré avec la commande directe")
+                logger.info("✅ Postfix démarré avec la commande directe")
                 
         except Exception as e:
-            print(f"⚠️  Attention: {str(e)}")
-            print("📝 Tentative de démarrage manuel...")
-            try:
-                subprocess.run(['/usr/lib/postfix/sbin/master', '-c', '/etc/postfix', '-d'], 
-                             check=False, capture_output=True)
-                print("✅ Postfix démarré en mode démon")
-            except:
-                print("⚠️  Postfix pourrait ne pas être démarré, mais nous allons continuer")
+            logger.warning(f"Attention lors du redémarrage: {str(e)}")
+            logger.info("Tentative de poursuite sans redémarrage...")
         
-        # Vérifier si Postfix fonctionne
-        self.check_postfix_status()
-        
-    def check_postfix_status(self):
-        """Vérifie si Postfix fonctionne"""
-        print("🔍 Vérification du statut de Postfix...")
-        try:
-            # Vérifier si le processus Postfix tourne
-            result = subprocess.run(['ps', 'aux'], capture_output=True, text=True)
-            if 'postfix' in result.stdout or 'master' in result.stdout:
-                print("✅ Postfix semble fonctionner")
-                return True
+    def select_random_item(self, items: List[Dict]) -> Dict:
+        """Sélectionner un item aléatoire avec prise en compte des poids"""
+        if not items:
+            return None
             
-            # Essayer de vérifier avec netstat
-            result = subprocess.run(['netstat', '-tlnp'], capture_output=True, text=True)
-            if ':25' in result.stdout or 'postfix' in result.stdout:
-                print("✅ Postfix écoute sur le port 25")
-                return True
-            
-            print("⚠️  Postfix ne semble pas fonctionner, tentative de démarrage...")
-            subprocess.run(['postfix', 'start'], check=False, capture_output=True)
-            time.sleep(2)
-            return True
-            
-        except Exception as e:
-            print(f"⚠️  Impossible de vérifier Postfix: {str(e)}")
-            return True  # Continuer quand même
+        # Si rotation_mode est weighted
+        if self.config.get("rotation_mode") == "weighted":
+            total_weight = sum(item.get('weight', 1) for item in items)
+            rand = random.uniform(0, total_weight)
+            current = 0
+            for item in items:
+                current += item.get('weight', 1)
+                if rand <= current:
+                    return item
         
-    def parse_header(self):
-        """Parse le header pour extraire les informations"""
-        header = self.config['header']
-        sender_email = None
-        sender_name = None
-        subject = None
+        # Mode random simple
+        return random.choice(items)
         
-        # Extraire From
-        from_match = re.search(r'From:\s*(.+?)\s*<(.+?)>', header)
-        if from_match:
-            sender_name = from_match.group(1).strip()
-            sender_email = from_match.group(2).strip()
-        else:
-            from_match = re.search(r'From:\s*(.+?@.+?)', header)
-            if from_match:
-                sender_email = from_match.group(1).strip()
-                sender_name = sender_email.split('@')[0]
+    def get_next_combination(self) -> Tuple[Dict, Dict, Dict]:
+        """Obtenir la prochaine combinaison template/sujet/from"""
+        template = self.select_random_item(self.templates)
+        subject = self.select_random_item(self.subjects)
+        from_line = self.select_random_item(self.from_lines)
         
-        # Extraire Subject
-        subject_match = re.search(r'Subject:\s*(.+)', header)
-        if subject_match:
-            subject = subject_match.group(1).strip()
+        return template, subject, from_line
         
-        return sender_email, sender_name, subject
-    
-    def create_email_content(self, recipient_email, custom_data=None):
-        """Crée le contenu de l'email"""
-        sender_email, sender_name, subject = self.parse_header()
+    def create_email_content(self, recipient: str, template: Dict, 
+                           subject: Dict, from_line: Dict, 
+                           custom_data: Dict = None) -> str:
+        """Créer le contenu de l'email"""
+        # Remplacer les variables dans le template
+        content = template['content']
         
-        if not sender_email:
-            sender_email = "noreply@localhost"
-        if not sender_name:
-            sender_name = "Mon Service"
-        if not subject:
-            subject = "Sans objet"
-        
-        # Remplacer les variables dans le body
-        body = self.config['body']
-        body = body.replace('{{email}}', recipient_email)
-        body = body.replace('{{date}}', datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        replacements = {
+            '{{email}}': recipient,
+            '{{timestamp}}': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            '{{template_name}}': template['name'],
+            '{{subject_text}}': subject['text'],
+            '{{from_name}}': from_line['name'],
+            '{{from_email}}': from_line['email']
+        }
         
         if custom_data:
             for key, value in custom_data.items():
-                body = body.replace(f'{{{{{key}}}}}', str(value))
+                replacements[f'{{{{{key}}}}}'] = str(value)
+        
+        for key, value in replacements.items():
+            content = content.replace(key, value)
         
         # Construire l'email complet
-        email_content = f"""From: {sender_name} <{sender_email}>
-To: {recipient_email}
-Subject: {subject}
+        email_content = f"""From: {from_line['name']} <{from_line['email']}>
+To: {recipient}
+Subject: {subject['text']}
 MIME-Version: 1.0
 Content-Type: text/html; charset=utf-8
 
-{body}
+{content}
 """
         return email_content
-    
-    def send_email_via_sendmail(self, recipient_email, email_content):
-        """Envoie un email via sendmail"""
+        
+    def send_email(self, recipient: str, template: Dict, 
+                  subject: Dict, from_line: Dict,
+                  session_id: str) -> bool:
+        """Envoyer un email via sendmail"""
+        email_content = self.create_email_content(recipient, template, subject, from_line)
+        
         try:
             process = subprocess.Popen(
                 ['sendmail', '-t'],
@@ -256,209 +551,231 @@ Content-Type: text/html; charset=utf-8
             
             stdout, stderr = process.communicate(input=email_content)
             
-            if process.returncode == 0:
-                return True, None
+            status = "SUCCESS" if process.returncode == 0 else "FAILED"
+            error_msg = stderr if process.returncode != 0 else None
+            
+            # Log dans la base de données
+            self.cursor.execute('''
+                INSERT INTO email_logs 
+                (session_id, email_address, template_id, subject_id, from_id, send_time, status, error_message)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (session_id, recipient, template['id'], subject['id'], 
+                  from_line['id'], datetime.now(), status, error_msg))
+            
+            self.conn.commit()
+            
+            if status == "SUCCESS":
+                logger.info(f"✅ Email envoyé à: {recipient}")
+                logger.debug(f"  Template: {template['name']}")
+                logger.debug(f"  Sujet: {subject['text']}")
+                logger.debug(f"  De: {from_line['name']} <{from_line['email']}>")
+                return True
             else:
-                return False, stderr
+                logger.error(f"❌ Erreur pour {recipient}: {error_msg}")
+                return False
                 
         except Exception as e:
-            return False, str(e)
-    
-    def send_email(self, recipient_email, custom_data=None):
-        """Envoie un email via sendmail"""
-        email_content = self.create_email_content(recipient_email, custom_data)
+            logger.error(f"❌ Exception pour {recipient}: {str(e)}")
+            
+            self.cursor.execute('''
+                INSERT INTO email_logs 
+                (session_id, email_address, template_id, subject_id, from_id, send_time, status, error_message)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (session_id, recipient, template['id'], subject['id'], 
+                  from_line['id'], datetime.now(), "FAILED", str(e)))
+            
+            self.conn.commit()
+            return False
+            
+    def start_session(self, list_id: int = None, list_name: str = None) -> str:
+        """Démarrer une nouvelle session d'envoi"""
+        session_id = hashlib.md5(str(datetime.now()).encode()).hexdigest()[:8]
         
-        success, error = self.send_email_via_sendmail(recipient_email, email_content)
-        
-        if success:
-            print(f"✅ Email envoyé à: {recipient_email}")
-            self.stats['total_sent'] += 1
-            return True
+        # Déterminer la liste d'emails
+        if list_id:
+            email_list = next((lst for lst in self.email_lists if lst['id'] == list_id), None)
+        elif list_name:
+            email_list = next((lst for lst in self.email_lists if lst['name'] == list_name), None)
         else:
-            print(f"❌ Erreur pour {recipient_email}: {error}")
-            self.stats['total_failed'] += 1
-            return False
-    
-    def send_test_email(self, test_number):
-        """Envoie un email de test"""
-        print(f"\n{'='*60}")
-        print(f"🧪 ENVOI D'UN EMAIL DE TEST #{test_number}")
-        print(f"{'='*60}")
-        
-        # Extraire les adresses de test du fichier test_after
-        test_emails = self.extract_test_emails()
-        
-        if not test_emails:
-            print("⚠️  Aucune adresse de test trouvée dans 3-testafter.txt")
-            print("   Ajoutez des adresses dans le fichier ou utilisez --test-now avec --test-email")
-            return False
-        
-        sender_email, sender_name, _ = self.parse_header()
-        
-        for test_email in test_emails:
-            print(f"📨 Envoi du test à: {test_email}")
+            # Utiliser la première liste disponible
+            email_list = self.email_lists[0] if self.email_lists else None
             
-            # Créer le contenu du test
-            test_subject = f"✅ TEST #{test_number} - Système d'envoi actif"
-            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if not email_list:
+            logger.error("Aucune liste d'emails disponible")
+            return None
             
-            test_body = f"""
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <meta charset="UTF-8">
-                <style>
-                    body {{ font-family: Arial, sans-serif; margin: 20px; }}
-                    .container {{ max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #ddd; border-radius: 5px; }}
-                    .header {{ background-color: #4CAF50; color: white; padding: 10px; text-align: center; }}
-                    .stats {{ background-color: #f9f9f9; padding: 15px; margin: 15px 0; }}
-                    .success {{ color: #4CAF50; font-weight: bold; }}
-                </style>
-            </head>
-            <body>
-                <div class="container">
-                    <div class="header">
-                        <h1>✅ TEST SYSTÈME #{test_number}</h1>
-                    </div>
-                    <div class="content">
-                        <p>Ceci est un email de test automatique envoyé par le système d'envoi d'emails.</p>
-                        
-                        <div class="stats">
-                            <h3>📊 STATISTIQUES ACTUELLES</h3>
-                            <p><strong>Total envoyés:</strong> {self.stats['total_sent']}</p>
-                            <p><strong>Total échoués:</strong> {self.stats['total_failed']}</p>
-                            <p><strong>Dernier test:</strong> #{self.stats['last_test_sent']}</p>
-                            <p><strong>Début:</strong> {self.stats['start_time'].strftime('%Y-%m-%d %H:%M:%S')}</p>
-                            <p><strong>Heure du test:</strong> {current_time}</p>
-                            <p><strong>Google Cloud Shell:</strong> Actif</p>
-                        </div>
-                        
-                        <p>Le système fonctionne correctement et continue d'envoyer des emails.</p>
-                        <p class="success">✅ STATUT: ACTIF ET FONCTIONNEL</p>
-                    </div>
-                    <div class="footer">
-                        <p><em>Ce message a été généré automatiquement depuis Google Cloud Shell.</em></p>
-                    </div>
-                </div>
-            </body>
-            </html>
-            """
-            
-            test_content = f"""From: {sender_name} <{sender_email}>
-To: {test_email}
-Subject: {test_subject}
-MIME-Version: 1.0
-Content-Type: text/html; charset=utf-8
-
-{test_body}
-"""
-            
-            success, error = self.send_email_via_sendmail(test_email, test_content)
-            
-            if success:
-                print(f"✅ Test #{test_number} envoyé avec succès à {test_email}")
-            else:
-                print(f"❌ Échec du test #{test_number} à {test_email}: {error}")
-                return False
+        # Calculer le hash de configuration
+        config_hash = self.calculate_config_hash()
         
-        self.stats['last_test_sent'] = test_number
-        self.last_test_time = datetime.now()
+        # Enregistrer la session
+        self.cursor.execute('''
+            INSERT INTO sessions 
+            (session_id, start_time, total_emails, sent_emails, failed_emails, status, config_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (session_id, datetime.now(), 0, 0, 0, "STARTED", config_hash))
         
-        # Enregistrer le test dans l'historique
-        test_info = {
-            'test_number': test_number,
-            'time': current_time,
-            'total_sent': self.stats['total_sent'],
-            'total_failed': self.stats['total_failed']
+        self.conn.commit()
+        self.current_session = session_id
+        
+        logger.info(f"🎬 Début de la session: {session_id}")
+        logger.info(f"📋 Liste: {email_list['name']}")
+        logger.info(f"📍 Position de reprise: {email_list['last_position']}")
+        
+        return session_id
+        
+    def calculate_config_hash(self) -> str:
+        """Calculer un hash de la configuration actuelle"""
+        config_data = {
+            'templates': [(t['id'], t['name']) for t in self.templates],
+            'subjects': [(s['id'], s['text']) for s in self.subjects],
+            'from_lines': [(f['id'], f['name']) for f in self.from_lines],
+            'config': self.config
         }
-        self.stats['batch_history'].append(test_info)
         
-        # Sauvegarder les stats dans un fichier
-        self.save_stats()
+        return hashlib.md5(json.dumps(config_data, sort_keys=True).encode()).hexdigest()
         
-        print(f"\n📈 Statistiques sauvegardées. Prochain test après {self.test_interval} emails.")
-        return True
-    
-    def extract_test_emails(self):
-        """Extrait les adresses email de test du fichier test_after"""
-        content = self.config['test_after']
+    def get_emails_from_list(self, list_id: int, start_position: int = 0, 
+                           limit: int = None) -> List[str]:
+        """Obtenir des emails depuis une liste"""
+        email_list = next((lst for lst in self.email_lists if lst['id'] == list_id), None)
+        if not email_list:
+            return []
+            
+        filepath = Path(email_list['file_path'])
+        if not filepath.exists():
+            logger.error(f"Fichier non trouvé: {filepath}")
+            return []
+            
         emails = []
-        
-        # Chercher des adresses email dans le contenu
-        email_pattern = r'[\w\.-]+@[\w\.-]+\.\w+'
-        found_emails = re.findall(email_pattern, content)
-        
-        for email in found_emails:
-            if email not in emails:
-                emails.append(email)
-        
-        # Si aucune adresse trouvée, utiliser l'expéditeur par défaut
-        if not emails:
-            sender_email, _, _ = self.parse_header()
-            if sender_email:
-                emails.append(sender_email)
-            else:
-                emails.append("admin@localhost")
-        
+        with open(filepath, 'r', encoding='utf-8') as f:
+            for i, line in enumerate(f):
+                if i < start_position:
+                    continue
+                    
+                email = line.strip()
+                if email and '@' in email:
+                    emails.append(email)
+                    
+                if limit and len(emails) >= limit:
+                    break
+                    
         return emails
-    
-    def save_stats(self):
-        """Sauvegarde les statistiques dans un fichier JSON"""
-        stats_file = os.path.join(self.config_dir, 'send_stats.json')
-        stats_data = {
-            'stats': self.stats,
-            'last_update': datetime.now().isoformat(),
-            'test_interval': self.test_interval,
-            'google_cloud_shell': True
-        }
         
-        with open(stats_file, 'w') as f:
-            json.dump(stats_data, f, indent=2, default=str)
-    
-    def load_stats(self):
-        """Charge les statistiques depuis le fichier JSON"""
-        stats_file = os.path.join(self.config_dir, 'send_stats.json')
-        if os.path.exists(stats_file):
-            try:
-                with open(stats_file, 'r') as f:
-                    data = json.load(f)
-                    # Convertir les dates
-                    data['stats']['start_time'] = datetime.fromisoformat(data['stats']['start_time'])
-                    self.stats = data['stats']
-                    print(f"📊 Statistiques chargées: {self.stats['total_sent']} emails envoyés")
-            except:
-                print("⚠️  Impossible de charger les statistiques précédentes")
-    
-    def check_test_condition(self, current_index):
-        """Vérifie si un test doit être envoyé"""
-        # Test après chaque intervalle
-        if current_index > 0 and current_index % self.test_interval == 0:
-            test_number = current_index // self.test_interval
-            print(f"\n🎯 Point de contrôle atteint: {current_index} emails envoyés")
-            print(f"🔄 Envoi du test #{test_number}...")
-            return True, test_number
+    def update_list_position(self, list_id: int, position: int):
+        """Mettre à jour la position dans la liste"""
+        self.cursor.execute(
+            "UPDATE email_lists SET last_position = ? WHERE list_id = ?",
+            (position, list_id)
+        )
+        self.conn.commit()
         
-        # Test toutes les 30 minutes également
-        if self.last_test_time:
-            time_diff = (datetime.now() - self.last_test_time).total_seconds()
-            if time_diff > 1800:  # 30 minutes
-                test_number = len(self.stats['batch_history']) + 1
-                print(f"\n⏰ 30 minutes écoulées depuis le dernier test")
-                print(f"🔄 Envoi du test de surveillance #{test_number}...")
-                return True, test_number
+    def send_bulk_emails(self, list_id: int = None, max_emails: int = None, 
+                        resume: bool = True):
+        """Envoyer des emails en masse avec gestion intelligente"""
+        # Démarrer une session
+        session_id = self.start_session(list_id)
+        if not session_id:
+            return
+            
+        # Obtenir la liste d'emails
+        email_list = next((lst for lst in self.email_lists if lst['id'] == list_id), None)
+        if not email_list:
+            logger.error("Liste d'emails non trouvée")
+            return
+            
+        # Déterminer la position de départ
+        start_position = email_list['last_position'] if resume else 0
         
-        return False, 0
-    
-    def show_progress(self, current, total, start_time):
-        """Affiche une barre de progression"""
-        percent = (current / total) * 100
+        # Obtenir les emails
+        emails = self.get_emails_from_list(list_id, start_position, max_emails)
+        total_emails = len(emails)
+        
+        if total_emails == 0:
+            logger.warning("Aucun email à envoyer")
+            return
+            
+        logger.info(f"📧 Emails à envoyer: {total_emails}")
+        logger.info(f"📍 Début à la position: {start_position}")
+        logger.info(f"⏸️  Pause après: {self.pause_after} emails")
+        logger.info(f"⏱️  Durée de pause: {self.pause_duration} secondes")
+        
+        sent_count = 0
+        failed_count = 0
+        current_position = start_position
+        
+        # Gestion du Ctrl+C
+        def signal_handler(sig, frame):
+            logger.info("\n\n⏹️  Interruption détectée. Sauvegarde de l'état...")
+            self.update_list_position(list_id, current_position)
+            self.update_session_stats(session_id, sent_count, failed_count, "INTERRUPTED")
+            self.show_session_stats(session_id)
+            sys.exit(0)
+            
+        signal.signal(signal.SIGINT, signal_handler)
+        
+        start_time = datetime.now()
+        
+        for i, email in enumerate(emails):
+            current_position = start_position + i + 1
+            
+            # Afficher la progression
+            self.show_progress(i, total_emails, sent_count, failed_count, start_time)
+            
+            # Sélectionner la combinaison aléatoire
+            template, subject, from_line = self.get_next_combination()
+            
+            # Envoyer l'email
+            if self.send_email(email, template, subject, from_line, session_id):
+                sent_count += 1
+            else:
+                failed_count += 1
+            
+            # Mettre à jour les stats de session
+            if (i + 1) % 10 == 0:  # Tous les 10 emails
+                self.update_session_stats(session_id, sent_count, failed_count, "RUNNING")
+            
+            # Vérifier si on doit faire une pause
+            if self.pause_after > 0 and (i + 1) % self.pause_after == 0 and (i + 1) < total_emails:
+                logger.info(f"\n⏸️  Pause après {i + 1} emails...")
+                logger.info(f"😴 Reprise dans {self.pause_duration} secondes")
+                
+                # Envoyer un email de test si configuré
+                if self.config.get("enable_test_emails") and self.config.get("test_email_recipients"):
+                    self.send_test_email(session_id, sent_count, failed_count)
+                
+                # Attendre
+                for remaining in range(self.pause_duration, 0, -1):
+                    print(f"\r⏳ Reprise dans {remaining} secondes...", end="", flush=True)
+                    time.sleep(1)
+                print()
+                
+                logger.info("🔄 Reprise de l'envoi...")
+            
+            # Pause entre les emails
+            time.sleep(self.config.get("delay_between_emails", 1))
+        
+        # Finaliser la session
+        self.update_list_position(list_id, current_position)
+        self.update_session_stats(session_id, sent_count, failed_count, "COMPLETED")
+        
+        # Envoyer un email de test final
+        if self.config.get("enable_test_emails") and self.config.get("test_email_recipients"):
+            self.send_test_email(session_id, sent_count, failed_count, is_final=True)
+        
+        # Afficher les stats finales
+        self.show_session_stats(session_id)
+        
+    def show_progress(self, current: int, total: int, sent: int, 
+                     failed: int, start_time: datetime):
+        """Afficher une barre de progression"""
+        percent = (current / total) * 100 if total > 0 else 0
         elapsed = datetime.now() - start_time
         elapsed_seconds = elapsed.total_seconds()
         
         if current > 0:
             rate = current / elapsed_seconds
             remaining = (total - current) / rate if rate > 0 else 0
-            remaining_str = time.strftime("%H:%M:%S", time.gmtime(remaining))
+            remaining_str = str(timedelta(seconds=int(remaining)))
         else:
             rate = 0
             remaining_str = "N/A"
@@ -467,318 +784,392 @@ Content-Type: text/html; charset=utf-8
         filled_length = int(bar_length * current // total)
         bar = '█' * filled_length + '░' * (bar_length - filled_length)
         
-        print(f"\r📊 Progression: [{bar}] {percent:.1f}% | "
-              f"{current}/{total} | "
+        print(f"\r📊 [{bar}] {percent:.1f}% | "
+              f"📨 {current}/{total} | "
               f"⏱️ {str(elapsed).split('.')[0]} | "
-              f"⏳ Reste: {remaining_str} | "
-              f"📨 {rate:.1f}/sec | "
-              f"✅ {self.stats['total_sent']} | "
-              f"❌ {self.stats['total_failed']}", end="", flush=True)
-    
-    def send_bulk_emails(self, delay=1, max_emails=None, start_from=0):
-        """Envoie des emails en masse avec tests périodiques"""
-        if not self.email_list:
-            print("❌ Aucune adresse email trouvée dans 1-data.txt")
-            print("   Utilisez --create-config pour créer des fichiers d'exemple")
+              f"⏳ {remaining_str} | "
+              f"⚡ {rate:.1f}/sec | "
+              f"✅ {sent} | "
+              f"❌ {failed}", end="", flush=True)
+        
+    def update_session_stats(self, session_id: str, sent: int, 
+                           failed: int, status: str):
+        """Mettre à jour les statistiques de session"""
+        self.cursor.execute('''
+            UPDATE sessions 
+            SET sent_emails = ?, failed_emails = ?, status = ?, end_time = ?
+            WHERE session_id = ?
+        ''', (sent, failed, status, datetime.now(), session_id))
+        self.conn.commit()
+        
+    def show_session_stats(self, session_id: str):
+        """Afficher les statistiques de session"""
+        self.cursor.execute(
+            "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+        )
+        session = self.cursor.fetchone()
+        
+        if not session:
             return
-        
-        # Charger les stats précédentes
-        self.load_stats()
-        
-        total = len(self.email_list)
-        print(f"📧 Nombre d'emails à envoyer: {total}")
-        print(f"🔄 Intervalle de test: tous les {self.test_interval} emails")
-        
-        if max_emails:
-            emails_to_send = self.email_list[start_from:start_from + max_emails]
-        else:
-            emails_to_send = self.email_list[start_from:]
-        
-        batch_size = len(emails_to_send)
-        print(f"🎯 Taille du lot: {batch_size}")
-        
-        success_count = self.stats['total_sent']
-        fail_count = self.stats['total_failed']
-        
-        # Gestion du Ctrl+C
-        def signal_handler(sig, frame):
-            print(f"\n\n⏹️  Interruption détectée. Arrêt de l'envoi...")
-            self.save_stats()
-            self.show_final_stats(success_count, fail_count, start_time)
-            sys.exit(0)
-        
-        signal.signal(signal.SIGINT, signal_handler)
-        
-        start_time = datetime.now()
-        
-        for i, email in enumerate(emails_to_send, start=start_from+1):
-            absolute_index = i
             
-            # Afficher la progression
-            self.show_progress(i - start_from, batch_size, start_time)
-            
-            # Vérifier si on doit envoyer un test
-            should_test, test_number = self.check_test_condition(absolute_index)
-            if should_test:
-                print()  # Nouvelle ligne pour le test
-                self.send_test_email(test_number)
-                print(f"\n🔄 Reprise de l'envoi principal...")
-            
-            # Envoyer l'email principal
-            custom_data = {
-                'numero': absolute_index,
-                'total': total,
-                'timestamp': datetime.now().isoformat(),
-                'test_interval': self.test_interval
-            }
-            
-            if self.send_email(email, custom_data):
-                success_count += 1
-            else:
-                fail_count += 1
-            
-            # Pause entre les envois
-            if i < len(emails_to_send):
-                time.sleep(delay)
-        
-        # Envoyer un test final
-        print("\n\n🎉 Envoi principal terminé !")
-        final_test_number = len(self.stats['batch_history']) + 1
-        print(f"📤 Envoi du test final #{final_test_number}...")
-        self.send_test_email(final_test_number)
-        
-        # Afficher le message final du fichier test_after
-        if self.config['test_after']:
-            print(f"\n{'='*60}")
-            print("📝 MESSAGE DE CONFIRMATION:")
-            print(f"{'='*60}")
-            print(self.config['test_after'])
-        
-        self.show_final_stats(success_count, fail_count, start_time)
-    
-    def show_final_stats(self, success_count, fail_count, start_time):
-        """Affiche les statistiques finales"""
-        total_time = datetime.now() - start_time
-        total_seconds = total_time.total_seconds()
-        
         print(f"\n{'='*60}")
-        print(f"📊 RÉCAPITULATIF FINAL - GOOGLE CLOUD SHELL")
+        print("📊 STATISTIQUES DE SESSION")
         print(f"{'='*60}")
-        print(f"✅ Emails envoyés avec succès: {success_count}")
-        print(f"❌ Emails échoués: {fail_count}")
-        if success_count + fail_count > 0:
-            print(f"📈 Taux de réussite: {(success_count/(success_count+fail_count)*100):.2f}%")
-        print(f"⏱️  Temps total: {str(total_time).split('.')[0]}")
-        
-        if total_seconds > 0:
-            rate = (success_count + fail_count) / total_seconds
-            print(f"⚡ Vitesse moyenne: {rate:.2f} emails/sec")
-        
-        print(f"🧪 Tests envoyés: {len(self.stats['batch_history'])}")
-        print(f"📅 Heure de début: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"📅 Heure de fin: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"🌐 Environnement: Google Cloud Shell")
+        print(f"Session ID: {session[0]}")
+        print(f"Début: {session[1]}")
+        print(f"Fin: {session[2] if session[2] else 'En cours'}")
+        print(f"Total emails: {session[3]}")
+        print(f"✅ Envoyés: {session[4]}")
+        print(f"❌ Échoués: {session[5]}")
+        print(f"Statut: {session[6]}")
         print(f"{'='*60}")
         
-        # Afficher l'historique des tests
-        if self.stats['batch_history']:
-            print("\n📋 HISTORIQUE DES TESTS:")
-            print(f"{'='*60}")
-            for test in self.stats['batch_history'][-5:]:  # 5 derniers tests
-                print(f"Test #{test['test_number']} à {test['time']} | "
-                      f"Total: {test['total_sent']} | "
-                      f"Échecs: {test['total_failed']}")
-
-def create_config_files():
-    """Crée les fichiers de configuration s'ils n'existent pas"""
-    configs = {
-        '0-header.txt': """From: Mon Service <service@votredomaine.com>
-Subject: Votre sujet ici
-MIME-Version: 1.0
-Content-Type: text/html; charset=utf-8""",
+    def send_test_email(self, session_id: str, sent: int, failed: int, 
+                       is_final: bool = False):
+        """Envoyer un email de test"""
+        if not self.config.get("test_email_recipients"):
+            return
+            
+        test_recipients = self.config["test_email_recipients"]
         
-        '1-data.txt': """email1@test.com
-email2@test.com
-email3@test.com
-email4@test.com
-email5@test.com""",
-        
-        '2-body.html': """<!DOCTYPE html>
+        for recipient in test_recipients:
+            template, subject, from_line = self.get_next_combination()
+            
+            # Créer un contenu spécial pour le test
+            test_content = f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>Email Important</title>
     <style>
-        body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
-        .container { max-width: 600px; margin: 0 auto; padding: 20px; }
-        .header { background-color: #f4f4f4; padding: 10px; text-align: center; }
-        .content { padding: 20px; }
-        .footer { margin-top: 30px; font-size: 12px; color: #666; }
+        body {{ font-family: Arial, sans-serif; }}
+        .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
+        .header {{ background-color: {'#4CAF50' if not is_final else '#2196F3'}; 
+                  color: white; padding: 15px; text-align: center; }}
+        .stats {{ background-color: #f5f5f5; padding: 15px; margin: 15px 0; }}
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>Bonjour cher client</h1>
+            <h2>{'✅ TEST PÉRIODIQUE' if not is_final else '🎉 ENVOI TERMINÉ'}</h2>
         </div>
-        <div class="content">
-            <p>Cher destinataire,</p>
-            <p>Ceci est un email envoyé depuis Google Cloud Shell.</p>
-            <p>Email: {{email}}</p>
-            <p>Numéro: {{numero}}/{{total}}</p>
-            <p>Date: {{timestamp}}</p>
-            <p>Test envoyé tous les: {{test_interval}} emails</p>
+        <p>Ceci est un email de test automatique.</p>
+        
+        <div class="stats">
+            <h3>📊 STATISTIQUES</h3>
+            <p><strong>Session:</strong> {session_id}</p>
+            <p><strong>Type:</strong> {'Test périodique' if not is_final else 'Test final'}</p>
+            <p><strong>Heure:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+            <p><strong>Emails envoyés:</strong> {sent}</p>
+            <p><strong>Emails échoués:</strong> {failed}</p>
+            <p><strong>Taux de réussite:</strong> {(sent/(sent+failed)*100 if sent+failed>0 else 0):.1f}%</p>
         </div>
-        <div class="footer">
-            <p>Cordialement,<br>Votre équipe de support</p>
-        </div>
+        
+        <p>Le système fonctionne correctement.</p>
+        <p><em>Message généré automatiquement</em></p>
     </div>
 </body>
-</html>""",
+</html>"""
+            
+            # Créer l'email
+            test_subject = f"{'[TEST] ' if not is_final else '[FIN] '}Système d'envoi - Session {session_id}"
+            
+            email_content = f"""From: {from_line['name']} <{from_line['email']}>
+To: {recipient}
+Subject: {test_subject}
+MIME-Version: 1.0
+Content-Type: text/html; charset=utf-8
+
+{test_content}
+"""
+            
+            # Envoyer l'email
+            try:
+                process = subprocess.Popen(
+                    ['sendmail', '-t'],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                
+                stdout, stderr = process.communicate(input=email_content)
+                
+                if process.returncode == 0:
+                    logger.info(f"✅ Email de test envoyé à: {recipient}")
+                else:
+                    logger.error(f"❌ Échec du test à {recipient}: {stderr}")
+                    
+            except Exception as e:
+                logger.error(f"❌ Exception lors du test: {str(e)}")
+                
+    def add_email_list(self, name: str, file_path: str):
+        """Ajouter une liste d'emails"""
+        # Compter les emails dans le fichier
+        count = 0
+        if Path(file_path).exists():
+            with open(file_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    if line.strip() and '@' in line.strip():
+                        count += 1
         
-        '3-testafter.txt': """📧 Système de test automatique pour Google Cloud Shell
-test_interval:500
+        self.cursor.execute('''
+            INSERT INTO email_lists (name, file_path, total_emails)
+            VALUES (?, ?, ?)
+        ''', (name, file_path, count))
+        
+        self.conn.commit()
+        self.load_email_lists()  # Recharger
+        
+        logger.info(f"✅ Liste ajoutée: {name} ({count} emails)")
+        
+    def add_template(self, name: str, content: str, weight: int = 1):
+        """Ajouter un template"""
+        self.cursor.execute('''
+            INSERT INTO templates (name, content, weight)
+            VALUES (?, ?, ?)
+        ''', (name, content, weight))
+        
+        self.conn.commit()
+        self.load_templates()  # Recharger
+        
+        logger.info(f"✅ Template ajouté: {name}")
+        
+    def add_subject(self, text: str, weight: int = 1):
+        """Ajouter un sujet"""
+        self.cursor.execute('''
+            INSERT INTO subjects (subject_text, weight)
+            VALUES (?, ?)
+        ''', (text, weight))
+        
+        self.conn.commit()
+        self.load_subjects()  # Recharger
+        
+        logger.info(f"✅ Sujet ajouté: {text}")
+        
+    def add_from_line(self, name: str, email: str, weight: int = 1):
+        """Ajouter une from line"""
+        self.cursor.execute('''
+            INSERT INTO from_lines (name, email, weight)
+            VALUES (?, ?, ?)
+        ''', (name, email, weight))
+        
+        self.conn.commit()
+        self.load_from_lines()  # Recharger
+        
+        logger.info(f"✅ From line ajouté: {name} <{email}>")
+        
+    def show_stats(self):
+        """Afficher les statistiques globales"""
+        print(f"\n{'='*60}")
+        print("📈 STATISTIQUES GLOBALES")
+        print(f"{'='*60}")
+        
+        # Sessions
+        self.cursor.execute("SELECT COUNT(*) FROM sessions")
+        total_sessions = self.cursor.fetchone()[0]
+        
+        self.cursor.execute("SELECT COUNT(*) FROM sessions WHERE status = 'COMPLETED'")
+        completed_sessions = self.cursor.fetchone()[0]
+        
+        # Emails
+        self.cursor.execute("SELECT COUNT(*) FROM email_logs")
+        total_emails = self.cursor.fetchone()[0]
+        
+        self.cursor.execute("SELECT COUNT(*) FROM email_logs WHERE status = 'SUCCESS'")
+        success_emails = self.cursor.fetchone()[0]
+        
+        # Templates, sujets, from lines
+        self.cursor.execute("SELECT COUNT(*) FROM templates WHERE is_active = 1")
+        active_templates = self.cursor.fetchone()[0]
+        
+        self.cursor.execute("SELECT COUNT(*) FROM subjects WHERE is_active = 1")
+        active_subjects = self.cursor.fetchone()[0]
+        
+        self.cursor.execute("SELECT COUNT(*) FROM from_lines WHERE is_active = 1")
+        active_froms = self.cursor.fetchone()[0]
+        
+        # Afficher
+        print(f"Sessions totales: {total_sessions}")
+        print(f"Sessions complétées: {completed_sessions}")
+        print(f"Emails envoyés: {success_emails}/{total_emails} ({(success_emails/total_emails*100 if total_emails>0 else 0):.1f}%)")
+        print(f"Templates actifs: {active_templates}")
+        print(f"Sujets actifs: {active_subjects}")
+        print(f"From lines actives: {active_froms}")
+        print(f"{'='*60}")
+        
+        # Dernières sessions
+        print("\n📋 5 DERNIÈRES SESSIONS:")
+        print(f"{'-'*60}")
+        self.cursor.execute('''
+            SELECT session_id, start_time, sent_emails, failed_emails, status
+            FROM sessions ORDER BY start_time DESC LIMIT 5
+        ''')
+        
+        for row in self.cursor.fetchall():
+            print(f"{row[0]}: {row[1]} | ✅{row[2]} ❌{row[3]} | {row[4]}")
 
-Ce système envoie automatiquement un email de test tous les 500 emails envoyés
-pour vérifier que le système fonctionne correctement dans Google Cloud Shell.
-
-ADDRESSES DE TEST (ajoutez vos adresses ci-dessous):
-votre.email@gmail.com
-backup@exemple.com
-
-Message de confirmation après envoi:
-✅ Tous les emails ont été envoyés avec succès depuis Google Cloud Shell !
-Le système a envoyé des tests périodiques pour vérifier son bon fonctionnement.
-Total d'emails envoyés: {{total_sent}}
-Tests effectués: {{test_count}}
-Merci d'avoir utilisé notre service d'envoi d'emails."""
+def create_default_config():
+    """Créer la configuration par défaut"""
+    config_dir = Path("config")
+    config_dir.mkdir(exist_ok=True)
+    
+    # Configuration principale
+    config = {
+        "pause_after": 100,
+        "pause_duration": 300,
+        "test_interval": 50,
+        "delay_between_emails": 1,
+        "max_emails_per_session": 1000,
+        "rotation_mode": "random",
+        "enable_test_emails": True,
+        "test_email_recipients": ["admin@example.com"],
+        "postfix_config": {
+            "myhostname": "localhost",
+            "inet_interfaces": "loopback-only"
+        }
     }
     
-    for filename, content in configs.items():
-        if not os.path.exists(filename):
-            with open(filename, 'w', encoding='utf-8') as f:
-                f.write(content)
-            print(f"📄 Fichier créé: {filename}")
+    with open(config_dir / "config.json", 'w', encoding='utf-8') as f:
+        json.dump(config, f, indent=2)
     
-    print("\n📝 MODIFIEZ LES FICHIERS AVANT DE LANCER:")
-    print("   1. Éditez 0-header.txt pour votre expéditeur et sujet")
-    print("   2. Ajoutez vos emails dans 1-data.txt")
-    print("   3. Modifiez 3-testafter.txt pour ajouter vos adresses de test")
-    print("   4. Changez test_interval:500 si nécessaire")
-
-def test_sendmail():
-    """Teste si sendmail fonctionne"""
-    print("🧪 Test de sendmail...")
-    try:
-        test_content = """From: test@localhost
-To: test@localhost
-Subject: Test sendmail
-
-Ceci est un test.
-"""
-        
-        process = subprocess.Popen(['sendmail', '-t'],
-                                 stdin=subprocess.PIPE,
-                                 stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE,
-                                 text=True)
-        stdout, stderr = process.communicate(input=test_content)
-        
-        if process.returncode == 0:
-            print("✅ sendmail fonctionne correctement")
-            return True
-        else:
-            print(f"❌ sendmail erreur: {stderr}")
-            return False
-            
-    except Exception as e:
-        print(f"❌ Erreur de test: {str(e)}")
-        return False
+    # Créer un exemple de liste d'emails
+    email_list_dir = config_dir / "email_lists"
+    email_list_dir.mkdir(exist_ok=True)
+    
+    with open(email_list_dir / "exemple.txt", 'w', encoding='utf-8') as f:
+        f.write("test1@example.com\ntest2@example.com\ntest3@example.com\n")
+    
+    print("✅ Configuration par défaut créée dans le dossier 'config'")
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Script d'envoi d'emails via Postfix sur Google Cloud Shell"
+        description="Script d'envoi d'emails intelligent pour Google Cloud Shell"
     )
-    parser.add_argument('--test', action='store_true', help='Tester sendmail uniquement')
-    parser.add_argument('--test-now', action='store_true', help='Envoyer un test immédiatement')
-    parser.add_argument('--create-config', action='store_true', help='Créer les fichiers de configuration')
-    parser.add_argument('--delay', type=float, default=1, help='Délai entre les emails (secondes)')
-    parser.add_argument('--max', type=int, help='Nombre maximum d\'emails à envoyer')
-    parser.add_argument('--start', type=int, default=0, help='Index de départ dans la liste')
-    parser.add_argument('--interval', type=int, help='Intervalle de test (nombre d\'emails)')
-    parser.add_argument('--config-dir', default='.', help='Répertoire des fichiers de configuration')
-    parser.add_argument('--stats', action='store_true', help='Afficher les statistiques')
-    parser.add_argument('--test-email', type=str, help='Email pour le test immédiat')
+    
+    subparsers = parser.add_subparsers(dest='command', help='Commandes disponibles')
+    
+    # Commande: send
+    send_parser = subparsers.add_parser('send', help='Envoyer des emails')
+    send_parser.add_argument('--list-id', type=int, help='ID de la liste d\'emails')
+    send_parser.add_argument('--list-name', type=str, help='Nom de la liste d\'emails')
+    send_parser.add_argument('--max', type=int, help='Nombre maximum d\'emails')
+    send_parser.add_argument('--no-resume', action='store_true', help='Ne pas reprendre depuis la dernière position')
+    send_parser.add_argument('--pause-after', type=int, help='Pause après X emails')
+    send_parser.add_argument('--pause-duration', type=int, help='Durée de la pause en secondes')
+    
+    # Commande: add
+    add_parser = subparsers.add_parser('add', help='Ajouter des éléments')
+    add_parser.add_argument('--template', type=str, help='Ajouter un template (spécifier --file)')
+    add_parser.add_argument('--subject', type=str, help='Ajouter un sujet')
+    add_parser.add_argument('--from-line', nargs=2, metavar=('NAME', 'EMAIL'), help='Ajouter une from line')
+    add_parser.add_argument('--email-list', nargs=2, metavar=('NAME', 'FILE'), help='Ajouter une liste d\'emails')
+    add_parser.add_argument('--file', type=str, help='Fichier pour le template')
+    add_parser.add_argument('--weight', type=int, default=1, help='Poids pour la rotation')
+    
+    # Commande: stats
+    stats_parser = subparsers.add_parser('stats', help='Afficher les statistiques')
+    
+    # Commande: config
+    config_parser = subparsers.add_parser('config', help='Gérer la configuration')
+    config_parser.add_argument('--create-default', action='store_true', help='Créer la configuration par défaut')
+    config_parser.add_argument('--show', action='store_true', help='Afficher la configuration')
+    
+    # Commande: test
+    test_parser = subparsers.add_parser('test', help='Tester le système')
+    test_parser.add_argument('--email', type=str, help='Email pour le test')
     
     args = parser.parse_args()
     
     print("="*60)
-    print("📧 SCRIPT D'ENVOI D'EMAILS - GOOGLE CLOUD SHELL")
+    print("🤖 SCRIPT D'ENVOI D'EMAILS INTELLIGENT")
     print("="*60)
     
-    # Vérifier l'environnement
-    if 'DEVSHELL_PROJECT_ID' in os.environ:
-        print("🌐 Environnement Google Cloud Shell détecté")
-        print("📝 Note: Utilisation de 'service' au lieu de 'systemctl'")
-    
-    if args.create_config:
-        create_config_files()
+    if args.command == 'config' and args.create_default:
+        create_default_config()
         return
     
-    if args.test:
-        test_sendmail()
-        return
+    # Initialiser le gestionnaire
+    manager = EmailManager("config")
     
-    try:
-        mailer = PostfixMailer(args.config_dir)
-        
-        if args.interval:
-            mailer.test_interval = args.interval
-            print(f"🔄 Intervalle de test défini sur: {mailer.test_interval} emails")
-        
-        if args.test_now:
-            print("🧪 Envoi d'un test immédiat...")
-            test_number = len(mailer.stats['batch_history']) + 1
-            if args.test_email:
-                # Créer un fichier temporaire avec l'email de test
-                temp_test = mailer.config['test_after'] + f"\n{args.test_email}"
-                mailer.config['test_after'] = temp_test
-            mailer.send_test_email(test_number)
-        elif args.stats:
-            mailer.load_stats()
-            mailer.show_final_stats(
-                mailer.stats['total_sent'],
-                mailer.stats['total_failed'],
-                mailer.stats['start_time']
-            )
-        else:
-            if not mailer.email_list:
-                print("❌ Aucune adresse email trouvée dans 1-data.txt")
-                print("   Utilisez --create-config pour créer des fichiers d'exemple")
-                return
+    if args.command == 'send':
+        # Appliquer les paramètres de pause si spécifiés
+        if args.pause_after:
+            manager.pause_after = args.pause_after
+        if args.pause_duration:
+            manager.pause_duration = args.pause_duration
             
-            print(f"📋 Expéditeur: {mailer.parse_header()[1]}")
-            print(f"📋 Sujet: {mailer.parse_header()[2]}")
-            print(f"📋 Destinataires: {len(mailer.email_list)}")
-            print(f"⏱️  Délai: {args.delay} seconde(s)")
-            print(f"🔄 Intervalle de test: tous les {mailer.test_interval} emails")
-            
-            confirm = input("\n⚠️  Voulez-vous continuer l'envoi ? (oui/non): ")
-            if confirm.lower() in ['oui', 'o', 'yes', 'y']:
-                mailer.send_bulk_emails(delay=args.delay, max_emails=args.max, start_from=args.start)
+        manager.send_bulk_emails(
+            list_id=args.list_id,
+            max_emails=args.max,
+            resume=not args.no_resume
+        )
+        
+    elif args.command == 'add':
+        if args.template and args.file:
+            if Path(args.file).exists():
+                with open(args.file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                manager.add_template(args.template, content, args.weight)
             else:
-                print("❌ Envoi annulé.")
+                print(f"❌ Fichier non trouvé: {args.file}")
                 
-    except KeyboardInterrupt:
-        print("\n\n⏹️  Script interrompu par l'utilisateur")
-    except Exception as e:
-        print(f"\n❌ Erreur critique: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        print(f"\n💡 Solutions possibles:")
-        print(f"   1. Essayez: sudo service postfix restart")
-        print(f"   2. Essayez: sudo postfix start")
-        print(f"   3. Vérifiez les logs: sudo tail -f /var/log/mail.log")
+        elif args.subject:
+            manager.add_subject(args.subject, args.weight)
+            
+        elif args.from_line:
+            manager.add_from_line(args.from_line[0], args.from_line[1], args.weight)
+            
+        elif args.email_list:
+            manager.add_email_list(args.email_list[0], args.email_list[1])
+            
+        else:
+            print("❌ Spécifiez ce que vous voulez ajouter")
+            
+    elif args.command == 'stats':
+        manager.show_stats()
+        
+    elif args.command == 'test':
+        # Tester avec un email spécifique
+        test_email = args.email or "test@localhost"
+        template, subject, from_line = manager.get_next_combination()
+        
+        print(f"🧪 Test d'envoi à: {test_email}")
+        print(f"   Template: {template['name']}")
+        print(f"   Sujet: {subject['text']}")
+        print(f"   De: {from_line['name']} <{from_line['email']}>")
+        
+        if manager.send_email(test_email, template, subject, from_line, "test_session"):
+            print("✅ Test réussi!")
+        else:
+            print("❌ Test échoué")
+            
+    elif args.command == 'config' and args.show:
+        print("📋 CONFIGURATION ACTUELLE:")
+        print(json.dumps(manager.config, indent=2))
+        
+    else:
+        print("\n🎯 UTILISATION:")
+        print("  python3 send.py send [--list-id ID] [--max N] [--no-resume]")
+        print("  python3 send.py add --template nom --file fichier.html")
+        print("  python3 send.py add --subject \"Mon sujet\"")
+        print("  python3 send.py add --from-line \"Nom\" email@exemple.com")
+        print("  python3 send.py add --email-list \"Ma liste\" emails.txt")
+        print("  python3 send.py stats")
+        print("  python3 send.py test [--email test@exemple.com]")
+        print("  python3 send.py config --create-default")
+        print("\n📝 EXEMPLE COMPLET:")
+        print("  1. python3 send.py config --create-default")
+        print("  2. Éditez config/config.json et ajoutez vos emails dans config/email_lists/")
+        print("  3. python3 send.py add --email-list \"Clients\" config/email_lists/clients.txt")
+        print("  4. python3 send.py send --list-name \"Clients\" --pause-after 50")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n👋 Script terminé par l'utilisateur")
+    except Exception as e:
+        print(f"\n❌ Erreur: {str(e)}")
+        import traceback
+        traceback.print_exc()
