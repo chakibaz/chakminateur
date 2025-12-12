@@ -1,71 +1,19 @@
-#!/bin/bash
-# setup.sh - Installation rapide pour Google Cloud Shell
+# Installation initiale
+sudo apt-get update
+sudo apt-get install -y python3 python3-pip postfix mailutils
+pip3 install sqlite3
 
-echo "🔧 Installation du script d'envoi d'emails..."
-echo "============================================"
+# Configuration
+mkdir -p config/email_lists
+mkdir -p config/templates
 
-# Mettre à jour et installer les dépendances
-echo "📦 Mise à jour des paquets..."
-sudo apt-get update -y
+# Copier vos fichiers
+cp vos_emails.txt config/email_lists/
+cp vos_templates/*.html config/templates/
 
-echo "📦 Installation des dépendances..."
-sudo apt-get install -y postfix mailutils
+# Lancer avec sudo
+sudo python3 send.py config --create-default
+sudo python3 send.py add --email-list "Ma liste" config/email_lists/vos_emails.txt
 
-# Créer les fichiers de configuration
-echo "📄 Création des fichiers de configuration..."
-cat > 0-header.txt << 'EOF'
-From: Votre Nom <votre@email.com>
-Subject: Votre sujet d'email
-MIME-Version: 1.0
-Content-Type: text/html; charset=utf-8
-EOF
-
-cat > 1-data.txt << 'EOF'
-test1@example.com
-test2@example.com
-test3@example.com
-EOF
-
-cat > 2-body.html << 'EOF'
-<!DOCTYPE html>
-<html>
-<body>
-<h1>Bonjour !</h1>
-<p>Ceci est un email de test depuis Google Cloud Shell.</p>
-<p>Email: {{email}}</p>
-<p>Date: {{timestamp}}</p>
-</body>
-</html>
-EOF
-
-cat > 3-testafter.txt << 'EOF'
-test_interval:100
-
-Adresses de test:
-votre.email@gmail.com
-
-Message après envoi:
-✅ Envoi terminé avec succès !
-EOF
-
-# Télécharger le script principal
-echo "📥 Téléchargement du script principal..."
-curl -o send.py https://raw.githubusercontent.com/chakibaz/chakminateur/refs/heads/main/send.py
-
-# Rendre le script exécutable
-chmod +x send.py
-
-echo ""
-echo "✅ Installation terminée !"
-echo ""
-echo "📝 FICHIERS CRÉÉS:"
-echo "   0-header.txt    - Configuration de l'expéditeur"
-echo "   1-data.txt      - Liste d'emails"
-echo "   2-body.html     - Template HTML"
-echo "   3-testafter.txt - Configuration des tests"
-echo "   send.py         - Script principal"
-echo ""
-echo "🎯 POUR COMMENCER:"
-echo "   1. Éditez les fichiers de configuration"
-echo "   2. Testez: sudo python3 send.py --test"
-echo "   3. Lancez: sudo python3 send.py"
+# Lancer l'envoi (reprise automatique si interruption)
+sudo python3 send.py send --list-name "Ma liste" --pause-after 100
