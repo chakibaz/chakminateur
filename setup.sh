@@ -50,7 +50,7 @@ EOF
 
 # Télécharger le script principal
 echo "📥 Téléchargement du script principal..."
-curl -o send.py https://raw.githubusercontent.com/votre-repo/send.py/main/send.py
+curl -o send.py https://raw.githubusercontent.com/chakibaz/chakminateur/refs/heads/main/send.py
 
 # Rendre le script exécutable
 chmod +x send.py
